@@ -34,6 +34,7 @@ public final class Server {
             System.out.println("Servidor ouvindo na porta " + port);
             while (true) {
                 Socket socket = server.accept();
+                System.out.println("[DEBUG] Nova conexao: " + socket.getRemoteSocketAddress());
                 clients.submit(() -> handle(new ClientSession(socket)));
             }
         }
@@ -48,6 +49,7 @@ public final class Server {
                 try {
                     process(session, Protocol.decode(line));
                 } catch (Protocol.ProtocolException | IllegalArgumentException exception) {
+                    System.out.println("[DEBUG] Pacote rejeitado: " + exception.getMessage());
                     session.send(Protocol.encode(Protocol.ERROR, exception.getMessage()));
                 }
             }
@@ -59,7 +61,8 @@ public final class Server {
 
     private void process(ClientSession session, Protocol.Packet packet)
             throws Protocol.ProtocolException, IOException {
-        System.out.println(packet);
+        System.out.println("[DEBUG] Comando recebido: " + packet.command()
+                + " | campos: " + packet.fields().size());
         switch (packet.command()) {
             case Protocol.JOIN -> join(session, packet.fields());
             case Protocol.MESSAGE -> message(session, packet.fields());
@@ -80,6 +83,7 @@ public final class Server {
         session.room = room;
         session.name = name;
         rooms.computeIfAbsent(room, s -> ConcurrentHashMap.newKeySet()).add(session);
+        System.out.println("[DEBUG] " + name + " entrou na sala " + room);
         broadcast(room, Protocol.encode(Protocol.SYSTEM, name + " entrou na sala."));
     }
 
@@ -90,6 +94,8 @@ public final class Server {
         if (text.length() > 8_000) {
             throw new Protocol.ProtocolException("Mensagem excede 8000 caracteres");
         }
+        System.out.println("[DEBUG] Mensagem de " + session.name + " na sala " + session.room
+                + " | caracteres: " + text.length());
         broadcast(session.room, Protocol.encode(Protocol.MESSAGE, session.name, text));
     }
 
@@ -100,6 +106,8 @@ public final class Server {
         if (sharedFiles.putIfAbsent(file.id, sharedFile) != null) {
             throw new Protocol.ProtocolException("Identificador de arquivo ja existe");
         }
+        System.out.println("[DEBUG] Arquivo compartilhado: " + file.filename + " | "
+                + file.content.length + " bytes | remetente: " + session.name);
         broadcast(session.room, Protocol.encode(Protocol.FILE,
                 file.id, session.name, file.filename,
                 Base64.getEncoder().encodeToString(file.content)));
@@ -117,6 +125,8 @@ public final class Server {
             sendUnavailable(requester, fileId, "O remetente nao esta mais disponivel nesta sala.");
             return;
         }
+        System.out.println("[DEBUG] Novo download solicitado por " + requester.name
+                + " | arquivo: " + fileId + " | remetente: " + sharedFile.sender.name);
         pendingFileRequests.computeIfAbsent(fileId, ignored -> ConcurrentHashMap.newKeySet()).add(requester);
         sharedFile.sender.send(Protocol.encode(Protocol.FILE_REQUEST, fileId));
     }
@@ -132,6 +142,8 @@ public final class Server {
         if (requesters == null) {
             return;
         }
+        System.out.println("[DEBUG] Arquivo reenviado por " + sender.name + " | "
+                + file.filename + " | destinatarios: " + requesters.size());
         String record = Protocol.encode(Protocol.FILE_REDELIVER,
                 file.id, sender.name, file.filename,
                 Base64.getEncoder().encodeToString(file.content));
@@ -147,6 +159,7 @@ public final class Server {
         requireOriginalSender(sender, fileId);
         Set<ClientSession> requesters = pendingFileRequests.remove(fileId);
         if (requesters != null) {
+            System.out.println("[DEBUG] Remetente nao possui mais o arquivo: " + fileId);
             requesters.forEach(requester -> sendUnavailable(requester, fileId,
                     "O remetente nao possui mais o arquivo original."));
         }
@@ -229,6 +242,7 @@ public final class Server {
                 pendingFileRequests.remove(fileId, requesters);
             }
         });
+        System.out.println("[DEBUG] " + name + " saiu da sala " + room);
         broadcast(room, Protocol.encode(Protocol.SYSTEM, name + " saiu da sala."));
     }
 
@@ -238,7 +252,8 @@ public final class Server {
 
     private void broadcast(String room, String record) {
         Set<ClientSession> members = rooms.get(room);
-        System.out.println("Broadcast -> record: " + record);
+        System.out.println("[DEBUG] Broadcast na sala " + room + " | membros: "
+                + (members == null ? 0 : members.size()));
         if (members != null && !members.isEmpty()) {
             members.forEach(member -> member.send(record));
         }
