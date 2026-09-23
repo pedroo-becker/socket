@@ -1,6 +1,5 @@
 package com.project;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -9,6 +8,9 @@ public final class Protocol {
     public static final String JOIN = "JOIN";
     public static final String MESSAGE = "MESSAGE";
     public static final String FILE = "FILE";
+    public static final String FILE_REQUEST = "FILE_REQUEST";
+    public static final String FILE_REDELIVER = "FILE_REDELIVER";
+    public static final String FILE_UNAVAILABLE = "FILE_UNAVAILABLE";
     public static final String QUIT = "QUIT";
     public static final String SYSTEM = "SYSTEM";
     public static final String ERROR = "ERROR";
@@ -33,18 +35,6 @@ public final class Protocol {
             throw new ProtocolException("Comando ausente");
         }
         return new Packet(values.get(0), values.subList(1, values.size()));
-    }
-
-    public static String base64(String value) {
-        return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
-    }
-
-    public static String unbase64Text(String value) throws ProtocolException {
-        try {
-            return new String(Base64.getDecoder().decode(value), StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException exception) {
-            throw new ProtocolException("Campo Base64 invalido");
-        }
     }
 
     public static byte[] unbase64Bytes(String value) throws ProtocolException {
@@ -107,6 +97,13 @@ public final class Protocol {
     }
 
     public record Packet(String command, List<String> fields) {
+        @Override
+        public String toString() {
+            return "Packet{" +
+                    "command='" + command + '\'' +
+                    ", fields=" + fields +
+                    '}';
+        }
     }
 
     public static final class ProtocolException extends Exception {

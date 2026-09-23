@@ -23,6 +23,7 @@ import javafx.stage.FileChooser;
 import javafx.stage.Modality;
 import javafx.stage.Stage;
 
+import java.awt.*;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.ByteArrayInputStream;
@@ -35,13 +36,16 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.util.Base64;
 import java.util.Locale;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 public final class ClientFX extends Application {
 
-    private static final int DEFAULT_PORT = 5000;
-    private static final int MAX_FILE_BYTES = 10 * 1024 * 1024;
+    private static final int DEFAULT_PORT = 5001;
     private static final double CHAT_IMAGE_WIDTH = 360;
 
     private final TextField hostField = new TextField("localhost");
@@ -73,10 +77,11 @@ public final class ClientFX extends Application {
     private Thread receiverThread;
 
     private volatile String currentName = "";
-    private volatile String currentRoom = "";
     private volatile Path downloadDirectory;
 
     private volatile Path pendingImage;
+    private final Map<String, SentFile> sentFiles = new ConcurrentHashMap<>();
+    private final Map<String, DownloadedFile> downloadedFiles = new ConcurrentHashMap<>();
 
     @Override
     public void start(Stage stage) {
@@ -262,7 +267,6 @@ public final class ClientFX extends Application {
                 socket = newSocket;
                 output = newOutput;
                 currentName = name;
-                currentRoom = room;
                 downloadDirectory = directory;
 
                 send(newOutput, Protocol.encode(Protocol.JOIN, room, name));
@@ -307,7 +311,7 @@ public final class ClientFX extends Application {
 
         try {
             send(Protocol.encode(Protocol.JOIN, newRoom, currentName));
-            currentRoom = newRoom;
+            sentFiles.clear();
             setStatus("Conectado | sala: " + newRoom);
         } catch (IOException exception) {
             showError("Falha ao trocar de sala:\n" + exception.getMessage());
@@ -331,26 +335,12 @@ public final class ClientFX extends Application {
 
         Thread.ofVirtual().start(() -> {
             try {
-                send(Protocol.encode(Protocol.MESSAGE, Protocol.base64(text)));
+                send(Protocol.encode(Protocol.MESSAGE, text));
                 Platform.runLater(messageField::clear);
             } catch (IOException exception) {
                 handleConnectionError(exception);
             }
         });
-    }
-
-    private void chooseImage() {
-        if (!isConnected()) {
-            showError("Conecte-se antes de enviar uma imagem.");
-            return;
-        }
-
-        FileChooser chooser = new FileChooser();
-        chooser.setTitle("Selecionar imagem");
-        chooser.getExtensionFilters().add(new FileChooser.ExtensionFilter(
-                "Imagens PNG, JPG, JPEG, GIF ou BMP",
-                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp"
-        ));
     }
 
     private void chooseFile() {
@@ -383,11 +373,6 @@ public final class ClientFX extends Application {
             }
 
             long size = Files.size(path);
-            if (size > MAX_FILE_BYTES) {
-                showError("A imagem excede 10 MB.");
-                return;
-            }
-
             Image image;
             try (var input = Files.newInputStream(path)) {
                 image = new Image(input);
@@ -445,17 +430,20 @@ public final class ClientFX extends Application {
         }
 
         byte[] bytes = Files.readAllBytes(path);
-        if (bytes.length > MAX_FILE_BYTES) {
-            Platform.runLater(() -> showError("O arquivo excede 10 MB."));
-            return;
-        }
-
+        String fileId = UUID.randomUUID().toString();
         String filename = path.getFileName().toString();
-        send(Protocol.encode(
-                Protocol.FILE,
-                Protocol.base64(filename),
-                Base64.getEncoder().encodeToString(bytes)
-        ));
+        sentFiles.put(fileId, new SentFile(filename, path.toAbsolutePath()));
+        try {
+            send(Protocol.encode(
+                    Protocol.FILE,
+                    fileId,
+                    filename,
+                    Base64.getEncoder().encodeToString(bytes)
+            ));
+        } catch (IOException exception) {
+            sentFiles.remove(fileId);
+            throw exception;
+        }
     }
 
     private void receive(Socket receivingSocket) {
@@ -487,46 +475,40 @@ public final class ClientFX extends Application {
         try {
             switch (packet.command()) {
                 case Protocol.SYSTEM -> {
-                    requireFields(packet, 1);
-                    String text = Protocol.unbase64Text(packet.fields().get(0));
+                    String text = packet.fields().get(0);
                     Platform.runLater(() -> addSystemMessage(text));
                 }
                 case Protocol.ERROR -> {
-                    requireFields(packet, 1);
-                    String text = Protocol.unbase64Text(packet.fields().get(0));
+                    String text = packet.fields().get(0);
                     Platform.runLater(() -> addErrorMessage(text));
                 }
                 case Protocol.MESSAGE -> {
-                    requireFields(packet, 2);
-                    String sender = Protocol.unbase64Text(packet.fields().get(0));
-                    String text = Protocol.unbase64Text(packet.fields().get(1));
+                    String sender = packet.fields().get(0);
+                    String text = packet.fields().get(1);
                     Platform.runLater(() -> addTextMessage(sender, text));
                 }
-                case Protocol.FILE -> processReceivedFile(packet);
+                case Protocol.FILE -> processReceivedFile(packet, false);
+                case Protocol.FILE_REDELIVER -> processReceivedFile(packet, true);
+                case Protocol.FILE_REQUEST -> respondToFileRequest(packet);
+                case Protocol.FILE_UNAVAILABLE -> processFileUnavailable(packet);
                 default -> Platform.runLater(() -> addSystemMessage(
                         "Pacote ignorado: " + packet.command()
                 ));
             }
-        } catch (Protocol.ProtocolException | IOException exception) {
+        } catch (Protocol.ProtocolException | IOException | RuntimeException exception) {
             Platform.runLater(() -> addErrorMessage(
                     "Falha ao processar pacote: " + exception.getMessage()
             ));
         }
     }
 
-    private void processReceivedFile(Protocol.Packet packet)
+    private void processReceivedFile(Protocol.Packet packet, boolean redelivery)
             throws Protocol.ProtocolException, IOException {
 
-        requireFields(packet, 3);
-
-        String sender = Protocol.unbase64Text(packet.fields().get(0));
-        String filename = Protocol.unbase64Text(packet.fields().get(1));
-        byte[] content = Protocol.unbase64Bytes(packet.fields().get(2));
-
-        validateFilename(filename);
-        if (content.length > MAX_FILE_BYTES) {
-            throw new Protocol.ProtocolException("Arquivo recebido excede 10 MB.");
-        }
+        String fileId = packet.fields().get(0);
+        String sender = packet.fields().get(1);
+        String filename = packet.fields().get(2);
+        byte[] content = Protocol.unbase64Bytes(packet.fields().get(3));
 
         Path directory = downloadDirectory;
         if (directory == null) {
@@ -542,19 +524,68 @@ public final class ClientFX extends Application {
 
         Files.write(destination, content, StandardOpenOption.CREATE_NEW);
 
+        Image image = null;
         if (isImageName(filename)) {
-            Image image = new Image(new ByteArrayInputStream(content));
-            if (!image.isError()) {
-                Path finalDestination = destination;
-                Platform.runLater(() -> addImageMessage(
-                        sender, filename, image, finalDestination
-                ));
-                return;
+            Image candidate = new Image(new ByteArrayInputStream(content));
+            if (!candidate.isError()) {
+                image = candidate;
             }
         }
-
         Path finalDestination = destination;
-        Platform.runLater(() -> addFileMessage(sender, filename, finalDestination));
+        Image finalImage = image;
+        Platform.runLater(() -> updateReceivedFile(
+                fileId, sender, filename, finalImage, finalDestination, redelivery
+        ));
+    }
+
+    private void respondToFileRequest(Protocol.Packet packet) {
+        String fileId = packet.fields().get(0);
+        Thread.ofVirtual().start(() -> resendFile(fileId));
+    }
+
+    private void resendFile(String fileId) {
+        SentFile sentFile = sentFiles.get(fileId);
+        if (sentFile == null || !Files.isRegularFile(sentFile.path)) {
+            sendUnavailable(fileId);
+            return;
+        }
+        try {
+            byte[] content = Files.readAllBytes(sentFile.path);
+            send(Protocol.encode(Protocol.FILE_REDELIVER, fileId,
+                    sentFile.filename, Base64.getEncoder().encodeToString(content)));
+        } catch (IOException exception) {
+            sendUnavailable(fileId);
+        }
+    }
+
+    private void sendUnavailable(String fileId) {
+        try {
+            send(Protocol.encode(Protocol.FILE_UNAVAILABLE, fileId));
+        } catch (IOException exception) {
+            handleConnectionError(exception);
+        }
+    }
+
+    private void processFileUnavailable(Protocol.Packet packet) throws Protocol.ProtocolException {
+        String fileId = packet.fields().get(0);
+        String reason = packet.fields().get(1);
+        Platform.runLater(() -> {
+            DownloadedFile file = downloadedFiles.get(fileId);
+            if (file != null) {
+                file.markUnavailable(reason);
+            }
+            addErrorMessage("Arquivo indisponível: " + reason);
+        });
+    }
+
+    private void updateReceivedFile(String fileId, String sender, String filename, Image image,
+                                    Path destination, boolean redelivery) {
+        DownloadedFile existing = downloadedFiles.get(fileId);
+        if (redelivery && existing != null) {
+            existing.markReceived(destination);
+            return;
+        }
+        addAttachment(fileId, sender, filename, image, destination);
     }
 
     private void addTextMessage(String sender, String text) {
@@ -564,7 +595,17 @@ public final class ClientFX extends Application {
         Label textLabel = new Label(text);
         textLabel.setWrapText(true);
 
-        VBox bubble = new VBox(4, senderLabel, textLabel);
+        LocalDateTime now = LocalDateTime.now();
+        int hour = now.getHour();
+        int minute = now.getMinute();
+        Label dateTime = new Label(hour + ":" + minute);
+
+        dateTime.setMaxWidth(Double.MAX_VALUE);
+        dateTime.setAlignment(Pos.CENTER_RIGHT);
+
+        HBox.setHgrow(dateTime, Priority.ALWAYS);
+
+        VBox bubble = new VBox(4, senderLabel, textLabel, dateTime);
         bubble.setPadding(new Insets(9));
         bubble.setMaxWidth(560);
         bubble.setStyle("-fx-background-color: #e9eef7; -fx-background-radius: 10;");
@@ -581,59 +622,68 @@ public final class ClientFX extends Application {
         chatBox.getChildren().add(row);
     }
 
-    private void addImageMessage(String sender, String filename, Image image, Path destination) {
+    private void addAttachment(String fileId, String sender, String filename, Image image, Path destination) {
+        DownloadedFile downloadedFile = new DownloadedFile(fileId, destination);
         Label senderLabel = new Label(sender);
         senderLabel.setStyle("-fx-font-weight: bold;");
 
-        ImageView imageView = new ImageView(image);
-        imageView.setFitWidth(CHAT_IMAGE_WIDTH);
-        imageView.setFitHeight(300);
-        imageView.setPreserveRatio(true);
-        imageView.setSmooth(true);
-        imageView.setStyle("-fx-cursor: hand;");
-        imageView.setOnMouseClicked(event -> openImageViewer(sender, filename, image));
-
-        Label filenameLabel = new Label(filename);
-        filenameLabel.setStyle("-fx-text-fill: #555555;");
-
-        Label hintLabel = new Label("Clique na imagem para ampliar");
-        hintLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: #777777;");
-
-        Button openButton = new Button("Abrir arquivo");
-        openButton.setOnAction(event -> openFile(destination));
-
-        VBox bubble = new VBox(6, senderLabel, imageView, filenameLabel, hintLabel, openButton);
+        VBox bubble = new VBox(6, senderLabel);
         bubble.setPadding(new Insets(9));
-        bubble.setMaxWidth(CHAT_IMAGE_WIDTH + 30);
-        bubble.setStyle("-fx-background-color: #f0f0f0; -fx-background-radius: 10;");
+        bubble.setStyle("-fx-background-color: #eeeeee; -fx-background-radius: 10;");
+        bubble.setMaxWidth(500);
+
+        if (image != null) {
+            ImageView imageView = new ImageView(image);
+            imageView.setFitWidth(CHAT_IMAGE_WIDTH);
+            imageView.setFitHeight(300);
+            imageView.setPreserveRatio(true);
+            imageView.setSmooth(true);
+            imageView.setStyle("-fx-cursor: hand;");
+            imageView.setOnMouseClicked(event -> openImageViewer(sender, filename, image));
+            bubble.getChildren().addAll(imageView, new Label(filename), new Label("Clique na imagem para ampliar"));
+            bubble.setMaxWidth(CHAT_IMAGE_WIDTH + 30);
+            bubble.setStyle("-fx-background-color: #f0f0f0; -fx-background-radius: 10;");
+        } else {
+            Label fileLabel = new Label("📎 " + filename);
+            fileLabel.setWrapText(true);
+            bubble.getChildren().add(fileLabel);
+        }
+
+        Button openButton = new Button(image == null ? "Abrir" : "Abrir arquivo");
+        openButton.setOnAction(event -> openFile(downloadedFile.destination));
+        Button redownloadButton = new Button("Baixar novamente");
+        redownloadButton.setOnAction(event -> requestRedelivery(downloadedFile));
+        Label downloadStatus = new Label("Salvo em " + destination.getFileName());
+        downloadStatus.setStyle("-fx-font-size: 11px; -fx-text-fill: #666666;");
+        downloadedFile.attach(openButton, redownloadButton, downloadStatus);
+
+        bubble.getChildren().addAll(openButton, redownloadButton, downloadStatus);
 
         HBox row = new HBox(bubble);
         row.setPadding(new Insets(0, 10, 0, 10));
         row.setAlignment(sender.equals(currentName) ? Pos.CENTER_RIGHT : Pos.CENTER_LEFT);
 
         chatBox.getChildren().add(row);
+        downloadedFiles.put(fileId, downloadedFile);
     }
 
-    private void addFileMessage(String sender, String filename, Path destination) {
-        Label senderLabel = new Label(sender);
-        senderLabel.setStyle("-fx-font-weight: bold;");
-
-        Label fileLabel = new Label("📎 " + filename);
-        fileLabel.setWrapText(true);
-
-        Button openButton = new Button("Abrir");
-        openButton.setOnAction(event -> openFile(destination));
-
-        VBox bubble = new VBox(6, senderLabel, fileLabel, openButton);
-        bubble.setPadding(new Insets(9));
-        bubble.setMaxWidth(500);
-        bubble.setStyle("-fx-background-color: #eeeeee; -fx-background-radius: 10;");
-
-        HBox row = new HBox(bubble);
-        row.setPadding(new Insets(0, 10, 0, 10));
-        row.setAlignment(sender.equals(currentName) ? Pos.CENTER_RIGHT : Pos.CENTER_LEFT);
-
-        chatBox.getChildren().add(row);
+    private void requestRedelivery(DownloadedFile downloadedFile) {
+        if (!isConnected()) {
+            showError("Conecte-se para solicitar uma nova cópia do arquivo.");
+            return;
+        }
+        if (Files.exists(downloadedFile.destination)) {
+            showError("Arquivo ja existe");
+            return;
+        }
+        downloadedFile.markRequested();
+        Thread.ofVirtual().start(() -> {
+            try {
+                send(Protocol.encode(Protocol.FILE_REQUEST, downloadedFile.fileId));
+            } catch (IOException exception) {
+                handleConnectionError(exception);
+            }
+        });
     }
 
     private void addSystemMessage(String text) {
@@ -698,7 +748,11 @@ public final class ClientFX extends Application {
 
     private void openFile(Path destination) {
         try {
-            if (!java.awt.Desktop.isDesktopSupported()) {
+            if (!Files.isRegularFile(destination)) {
+                showError("O arquivo foi removido. Use o botão 'Baixar novamente'.");
+                return;
+            }
+            if (!Desktop.isDesktopSupported()) {
                 showError("O sistema não oferece suporte para abrir arquivos automaticamente.");
                 return;
             }
@@ -730,25 +784,6 @@ public final class ClientFX extends Application {
                 || lower.endsWith(".jpeg")
                 || lower.endsWith(".gif")
                 || lower.endsWith(".bmp");
-    }
-
-    private void validateFilename(String filename) throws Protocol.ProtocolException {
-        if (filename == null
-                || filename.isBlank()
-                || filename.length() > 120
-                || filename.contains("/")
-                || filename.contains("\\")) {
-            throw new Protocol.ProtocolException("Nome de arquivo recebido inválido");
-        }
-    }
-
-    private void requireFields(Protocol.Packet packet, int count)
-            throws Protocol.ProtocolException {
-        if (packet.fields().size() < count) {
-            throw new Protocol.ProtocolException(
-                    packet.command() + " recebeu campos insuficientes"
-            );
-        }
     }
 
     private boolean isConnected() {
@@ -804,6 +839,7 @@ public final class ClientFX extends Application {
         socket = null;
         output = null;
         receiverThread = null;
+        sentFiles.clear();
 
         Platform.runLater(() -> {
             connectButton.setDisable(false);
@@ -845,6 +881,46 @@ public final class ClientFX extends Application {
             return String.format(Locale.ROOT, "%.1f KB", bytes / 1024.0);
         }
         return String.format(Locale.ROOT, "%.1f MB", bytes / (1024.0 * 1024.0));
+    }
+
+    private record SentFile(String filename, Path path) {
+    }
+
+    private static final class DownloadedFile {
+        private final String fileId;
+        private volatile Path destination;
+        private Button openButton;
+        private Button redownloadButton;
+        private Label statusLabel;
+
+        private DownloadedFile(String fileId, Path destination) {
+            this.fileId = fileId;
+            this.destination = destination;
+        }
+
+        private void attach(Button openButton, Button redownloadButton, Label statusLabel) {
+            this.openButton = openButton;
+            this.redownloadButton = redownloadButton;
+            this.statusLabel = statusLabel;
+        }
+
+        private void markRequested() {
+            redownloadButton.setDisable(true);
+            statusLabel.setText("Solicitando nova cópia...");
+        }
+
+        private void markReceived(Path newDestination) {
+            destination = newDestination;
+            openButton.setDisable(false);
+            redownloadButton.setDisable(false);
+            statusLabel.setText("Baixado novamente em " + newDestination.getFileName());
+        }
+
+        private void markUnavailable(String reason) {
+            openButton.setDisable(!Files.isRegularFile(destination));
+            redownloadButton.setDisable(false);
+            statusLabel.setText("Indisponível: " + reason);
+        }
     }
 
     public static void main(String[] args) {
